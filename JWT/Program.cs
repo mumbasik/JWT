@@ -60,33 +60,76 @@ namespace Errors
             const string JWTIssuer = "TicketCinemaIssuer";
             const string JWTAudience = "TicketCinemaAudience";
 
-           
+
             builder.Services.AddAuthentication(options =>
             {
                 options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
             })
-            .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
+    .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
+    {
+        options.Cookie.Name = "CinemaCookie";
+        options.Events.OnRedirectToLogin = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        };
+    })
+    .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = JWTIssuer,
+            ValidAudience = JWTAudience,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(JWTSecret))
+        };
+    })
+    
+    .AddOAuth("GitHub", options =>
+    {
+        options.ClientId = "Ov23litvC6UuuTeEozMZ";
+        options.ClientSecret = "74b0fde597c02be5db3322f5f1ad76990fa16485";
+        options.ClaimsIssuer = "GitHub";
+
+        
+        options.CallbackPath = new PathString("/signin-github");
+
+        
+        options.AuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+        options.TokenEndpoint = "https://github.com/login/oauth/access_token";
+        options.UserInformationEndpoint = "https://api.github.com/user";
+
+       
+        options.Scope.Add("user:email");
+
+      
+        options.ClaimActions.MapJsonKey(ClaimTypes.NameIdentifier, "id");
+        options.ClaimActions.MapJsonKey(ClaimTypes.Name, "name");
+        options.ClaimActions.MapJsonKey(ClaimTypes.Email, "email");
+
+       
+        options.Events = new Microsoft.AspNetCore.Authentication.OAuth.OAuthEvents
+        {
+            OnCreatingTicket = async context =>
             {
-                options.Cookie.Name = "CinemaCookie";
-                options.Events.OnRedirectToLogin = context =>
-                {
-                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    return Task.CompletedTask;
-                };
-            })
-            .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
-            {
-                options.TokenValidationParameters = new TokenValidationParameters
-                {
-                    ValidateIssuer = true,
-                    ValidateAudience = true,
-                    ValidateLifetime = true,
-                    ValidateIssuerSigningKey = true,
-                    ValidIssuer = JWTIssuer,
-                    ValidAudience = JWTAudience,
-                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(JWTSecret))
-                };
-            });
+                var request = new HttpRequestMessage(HttpMethod.Get, context.Options.UserInformationEndpoint);
+                request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", context.AccessToken);
+
+                var response = await context.Backchannel.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.HttpContext.RequestAborted);
+                response.EnsureSuccessStatusCode();
+
+                using var user = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+                context.RunClaimActions(user.RootElement);
+            }
+        };
+    });
+
+
+
 
             builder.Services.AddAuthorization();
 
@@ -262,6 +305,46 @@ namespace Errors
                 var userId = int.Parse(principal.FindFirst(ClaimTypes.NameIdentifier)!.Value);
                 var bookings = await db.Bookings.Where(b => b.UserId == userId).ToListAsync();
                 return Results.Ok(bookings);
+            });
+
+            app.MapGet("/login-github", async (HttpContext context) =>
+            {
+              
+                var properties = new AuthenticationProperties { RedirectUri = "/auth/external-callback" };
+                await context.ChallengeAsync("GitHub", properties);
+            });
+
+            app.MapGet("/auth/external-callback", async (HttpContext context, AppDbContext db) =>
+            {
+               
+                var result = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                if (!result.Succeeded || result.Principal == null)
+                {
+                    return Results.Unauthorized();
+                }
+
+             
+                var emailClaim = result.Principal.FindFirst(ClaimTypes.Email);
+
+               
+                var email = emailClaim?.Value ?? $"{result.Principal.FindFirst(ClaimTypes.Name)?.Value}@github.local";
+
+                var user = await db.Users.FirstOrDefaultAsync(u => u.Email == email);
+                if (user == null)
+                {
+                    user = new User
+                    {
+                        Email = email,
+                        Name = result.Principal.FindFirst(ClaimTypes.Name)?.Value ?? "GitHub User",
+                        PasswordHash = "" 
+                    };
+                    db.Users.Add(user);
+                    await db.SaveChangesAsync();
+                }
+
+                
+                await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, result.Principal);
+                return Results.Ok(new { message = "User logged in with GitHub successfully", user = user.Name });
             });
 
             app.Run();
